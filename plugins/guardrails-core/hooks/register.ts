@@ -30,7 +30,7 @@ const IGNORE_PII      = /@(example\.(com|org)|anthropic\.com)$|^noreply@/i
 // commands that only READ (allowed freely, also when piped or chained after cd)
 const READ_VERB  = /^\s*(cat|type|Get-Content|gc|head|tail|less|more|grep|rg|Select-String|sls|findstr|cut|awk|sed|wc|sort|uniq|ForEach-Object|Where-Object|Select-Object|Measure-Object|cd|Set-Location|ls|dir|Get-ChildItem)\b/i
 // read verbs that can still write or execute
-const WRITE_FORM = /\bsed\b[^|]*\s-[a-z]*i|\bawk\b[^|]*\bsystem\s*\(|\bSet-Content\b|\bOut-File\b/i
+const WRITE_FORM = /\bsed\b[^|]*\s-[a-z]*i|\bawk\b[^|]*\bsystem\s*\(|\bawk\b[^;&|]*>|\bSet-Content\b|\bOut-File\b/i
 
 // secret files: by path (file tools) and by name inside a command (shell)
 const SECRET_FILE        = /(^|\/)(\.env(\..*)?|secrets\/.*|.*\.(pem|key|p12|pfx|jks))$/i
@@ -68,7 +68,8 @@ const DETECTORS: [string, string, RegExp][] = [
   ['secret', 'Private key',           /(?<v>-----BEGIN [A-Z ]*PRIVATE KEY-----)/g],
   ['secret', 'DB password in URL',    /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis):\/\/[^\s:\/@]+:(?<v>[^\s@\/\\]{6,})@/gi],
   ['secret', 'JDBC password',         /jdbc:[a-z]+:\/\/[^\s"']*[?&]password=(?<v>[^&\s"'$]+)/gi],
-  ['secret', 'Password/secret value', /\b[\w.-]*(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token)\s*[=:]\s*["']?(?!\$\{)(?<v>[^\s"'$,;\\]{8,})/gi],
+  // [ \t] not \s: an empty `password=` must not take the next line as its value
+  ['secret', 'Password/secret value', /\b[\w.-]*(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token)[ \t]*[=:][ \t]*["']?(?!\$\{)(?<v>[^\s"'$,;\\]{8,})/gi],
   ['pii',    'Email address',         /\b(?<v>[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/g],
   ['pii',    'US SSN',                /\b(?<v>\d{3}-\d{2}-\d{4})\b/g],
   // 13-16 digits, first 3-6, optional single space/dash between digits; learn() applies the Luhn check
@@ -76,6 +77,29 @@ const DETECTORS: [string, string, RegExp][] = [
   // US style with separators, or E.164; 10 bare digits (IDs) do not match
   ['pii',    'Phone number',          /(?<![\d+-])(?<v>(?:\+?1[ .-]?)?(?:\(\d{3}\)[ .-]?|\d{3}[ .-])\d{3}[ .-]\d{4}|\+\d{11,14})(?!\d)/g],
 ]
+
+// 'Password/secret value' also matches code: `password: string)`, `apiKey: STATUS_DONE`,
+// `token = this.auth.get()`, `Password:</label>`. In code, a type, call, markup, dotted path or
+// constant name is not a value. Config files (and command output naming one) are always values.
+// Anywhere: a type (`string)`, `Promise<`), a whole call `a.b()`, markup, an arrow. In a code file also a
+// dotted path starting lowercase and an UPPER_SNAKE constant; a command keeps those, as they can be passwords.
+const CODE_SHAPE = /^(string|number|boolean|any|object|unknown|void|String|Integer|Long|Boolean|Object|char|byte|Optional|Promise|Observable|Map|List|Set)(\)|<|\[\]|\s*\||$)|^[A-Za-z_$][\w$.]*\([^)]*\)$|^<\/?\w|<\/|=>/
+const CONFIG_SOURCE = /\.(properties|ya?ml|env|conf|cfg|ini|toml|tfvars|json|xml)\b|(^|[\/\\\s])\.env\b/i
+const isCodeValue = (v: string, inCodeFile: boolean) =>
+  CODE_SHAPE.test(v) || (inCodeFile && (/^[a-z_$][\w$]*(\.[A-Za-z_$][\w$]*)+$/.test(v) || /^[A-Z][A-Z_]*$/.test(v)))
+// source: the file or output the text came from; '' for a tool call's own arguments
+const secretMatches = (text: string, label: string, re: RegExp, source = '') =>
+  [...text.matchAll(re)].filter(m => label !== 'Password/secret value' || CONFIG_SOURCE.test(source) ||
+    !isCodeValue((m.groups && m.groups.v) || m[0], source !== ''))
+
+// A personal-data field only counts when its value has the shape: `birth: <prose>` is not a birth date
+const LOOKS_LIKE: Record<string, RegExp> = { email: /@/, phone: /(\d\D*){7}/, dob: /\d/, zip: /\d/, card: /(\d\D*){12}/ }
+// A personal-data field value (a name, an address) counts only as a whole token, so "Hollis" does not
+// match "Hollister". Secrets, emails, phones and cards are specific enough to match anywhere.
+// JSON escapes (\n, \t) become spaces first, so a value at the start of a line still has a boundary.
+const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const containsToken = (text: string, v: string) =>
+  text.includes(v) && new RegExp('(?<!\\w)' + esc(v) + '(?!\\w)').test(text.replace(/\\[nrt]/g, ' '))
 
 // ================= TYPES =================
 export type Level = 'high' | 'medium'
@@ -156,7 +180,7 @@ function secretUse(call: Record<string, any>, c: { tool: string; path: string; c
 
   // values Claude saw earlier (in a file, a log, a command's output)
   for (const [v, info] of mem.tracked) {
-    if (!args.includes(v)) continue
+    if (info.label.startsWith('Personal data (') ? !containsToken(args, v) : !args.includes(v)) continue
     if (info.kind === 'secret') {
       secretUsed = true
       if (c.isWrite) hardcoded = true // copying a seen secret into a file hardcodes it
@@ -177,7 +201,7 @@ function secretUse(call: Record<string, any>, c: { tool: string; path: string; c
   } else {
     // brand-new secrets typed straight into a command or a request
     for (const [kind, label, re] of DETECTORS) {
-      if (kind === 'secret' && args.match(re) && !hits.some(h => h.startsWith(label))) {
+      if (kind === 'secret' && secretMatches(args, label, re).length && !hits.some(h => h.startsWith(label))) {
         hits.push(label + ' (hardcoded in this action)')
         hardcoded = true
       }
@@ -187,10 +211,13 @@ function secretUse(call: Record<string, any>, c: { tool: string; path: string; c
   // indirect use: secret files / secret variables in a non-read command
   // (source .env, --env-file, $(grep ... .env), $API_TOKEN, $env:DB_PASSWORD)
   if (c.cmd && !isPureRead(c.cmd)) {
-    for (const [name, full] of mem.secretFiles) if (c.cmd.includes(name)) { hits.push('values from ' + full); secretUsed = true }
+    // quoted heredoc bodies are text, unless an interpreter reads them (python - <<'EOF', cat <<'EOF' | sh)
+    const live = c.cmd.replace(HEREDOC, (m, _q, _d, rest, at) => INTERPRETER.test(c.cmd.slice(0, at).split(/[;&|\n]/).pop() || '') || INTERPRETER.test(rest) ? m : rest)
+    // a secret file named as a path part of the command; naming it in a PR body or commit message is text
+    for (const [name, full] of mem.secretFiles)
+      if (new RegExp('(?<![\\w.-])' + esc(name) + '(?![\\w.-])').test(live)) { hits.push('values from ' + full); secretUsed = true }
     const f = c.cmd.match(SENSITIVE_FILE_REF)
     if (f) { hits.push('values from sensitive file ' + f[2]); secretUsed = true }
-    const live = c.cmd.replace(HEREDOC, (m, _q, _d, rest, at) => INTERPRETER.test(c.cmd.slice(0, at).split(/[;&|\n]/).pop() || '') ? m : rest) // quoted heredoc bodies are text
     const a = (APP_OUTBOUND.test(live) || SUBSTITUTION.test(live)) && live.match(APP_CONFIG_REF)
     if (a) { hits.push('values from sensitive file ' + a[0].replace(/^[\s"'=\/\\(<@]/, '')); secretUsed = true }
     const v = c.cmd.match(SECRET_VAR_REF)
@@ -222,12 +249,18 @@ function writtenSecrets(path: string, content: string): string[] {
 }
 
 export function isPureRead(cmd: string) {
-  // single-quoted text is literal: its | ; $ & are not shell syntax
-  const bare = cmd.replace(/'[^']*'/g, "''")
-  if (/\$\(|`|<\(/.test(bare) || WRITE_FORM.test(cmd)) return false
+  // quoted text is literal: its | ; & are not shell syntax (grep "a\|b" has no pipe). One pass, so a
+  // quote inside the other kind ("it's") or an escaped quote (\") cannot hide a command. A $( or `
+  // inside double quotes still runs.
+  let substitution = false
+  const text = cmd.replace(/\\.|'[^']*'|"(?:[^"\\]|\\.)*"/g, m => {
+    if (m[0] === '"' && /\$\(|`/.test(m)) substitution = true
+    return m[0] === '\\' ? '_' : "''"
+  })
+  if (substitution || /\$\(|`|<\(/.test(text) || WRITE_FORM.test(cmd)) return false
   // harmless redirects only; any other > writes a file
-  if (/>/.test(bare.replace(/\d?>\s*(\/dev\/null|\$null|NUL)\b|\d>&\d/gi, ''))) return false
-  return bare.split(/&&|\|\||[|;]/).every(s => READ_VERB.test(s))
+  if (/>/.test(text.replace(/\d?>\s*(\/dev\/null|\$null|NUL)\b|\d>&\d/gi, ''))) return false
+  return text.split(/&&|\|\||[|;]/).every(s => READ_VERB.test(s))
 }
 
 // ================= RULE 6 HELPERS =================
@@ -299,7 +332,7 @@ function normalize(p: string) {
 export function learn(text: string, source: string, mem: Memory) {
   const found: [string, string][] = []
   for (const [kind, label, re] of DETECTORS) {
-    for (const m of text.matchAll(re)) {
+    for (const m of secretMatches(text, label, re, source)) {
       const v = (m.groups && m.groups.v) || m[0]
       if (!v || v.length < 6) continue
       if (kind === 'pii' && IGNORE_PII.test(v)) continue
@@ -315,6 +348,7 @@ export function learn(text: string, source: string, mem: Memory) {
     const cls = classify(k)
     if (!cls || !PII_FIELD.test(cls) || v.length < 6 || NOT_VALUE.test(v) || CODE_LIKE.test(v) || (/^[a-z_]\w*$/i.test(v) && classify(v) && (/[a-z][A-Z_]|_/.test(v) || k.toLowerCase().endsWith(v.toLowerCase())))) continue
     if (cls === 'email' && IGNORE_PII.test(v)) continue
+    if (LOOKS_LIKE[cls] && !LOOKS_LIKE[cls].test(v)) continue
     if (mem.tracked.has(v) || mem.tracked.size >= MAX_TRACKED) continue
     const label = 'Personal data (' + k + ')'
     mem.tracked.set(v, { kind: 'pii', label, source })
@@ -370,6 +404,10 @@ async function riskAsk($: any, question: string, tool: string, hits: string[], l
   return answer === ACCEPT
 }
 
+// only a 🟡 use that stays on this machine can be remembered once accepted
+const rememberable = (call: Record<string, any>, level: Level) =>
+  level === 'medium' && !OUTBOUND_TOOLS.test(call.tool || '') && !OUTBOUND_CMD.test(String(call.command || ''))
+
 function audit($: any, msg: string) {
   $.ui.log('[guardrails-core] ' + new Date().toISOString() + ' ' + msg, { to: 'debug' })
 }
@@ -377,6 +415,9 @@ function audit($: any, msg: string) {
 // ================= HOOKS =================
 export const register: Register = on => {
   const mem = newMemory()
+  // ponytail: an accepted 🟡 local use (label + source) is not asked again this session. A 🔴 dialog,
+  // anything sent out, and a hardcoded literal are always asked: the next target or value may differ.
+  const accepted = new Set<string>()
 
   on('tool.call', async ($, e, next) => {
     const call: any = e
@@ -410,6 +451,8 @@ export const register: Register = on => {
         call.tool, ['policy: ' + verdict.reason], 'high')
       audit($, 'POLICY ' + call.tool + ' HIGH [' + verdict.reason + '] -> ' + (ok ? 'RISK ACCEPTED' : 'CANCELLED'))
       if (!ok) return { deny: POLICY + verdict.reason + '. The user did not accept the risk. Do not retry the same thing another way; explain the safe alternative.' }
+    } else if (verdict.kind === 'ask' && rememberable(call, verdict.level) && verdict.hits.every(h => accepted.has(h))) {
+      audit($, 'USE ' + call.tool + ' MEDIUM [' + verdict.hits.join('; ') + '] -> ACCEPTED EARLIER')
     } else if (verdict.kind === 'ask') {
       const { hits, level } = verdict
       const ok = await riskAsk($,
@@ -419,6 +462,7 @@ export const register: Register = on => {
         'If you continue, YOU accept responsibility for this risk.',
         call.tool, hits, level)
       audit($, 'USE ' + call.tool + ' ' + level.toUpperCase() + ' [' + hits.join('; ') + '] -> ' + (ok ? 'RISK ACCEPTED' : 'CANCELLED'))
+      if (ok && rememberable(call, level)) for (const h of hits) if (!h.includes('(hardcoded in')) accepted.add(h)
       if (!ok) {
         return { deny: 'The user did not accept the risk of using sensitive data (' + hits.join('; ') + ') in this action. Do not retry the same thing another way. Ask the user how they want to proceed.' }
       }
@@ -433,10 +477,10 @@ export const register: Register = on => {
     if (result && !result.deny && !result.isError) {
       const source = sourceName(call, mem)
       const found = learn(JSON.stringify(result), source, mem)
-      if (found.some(([k]) => k === 'secret') && (call.file_path || call.path)) {
-        const full: string = call.file_path || call.path
-        mem.secretFiles.set(full.split(/[\\\/]/).pop() as string, full)
-      }
+      // only a file: a Grep over a folder (path=src) must not make every command naming src ask
+      const full: string = call.file_path || call.path || ''
+      const name = full.split(/[\\\/]/).pop() || ''
+      if (found.some(([k]) => k === 'secret') && /\./.test(name)) mem.secretFiles.set(name, full)
       if (found.length && !mem.noticed.has(source)) {
         mem.noticed.add(source)
         $.ui.log('NOTICE: ' + source + ' contains ' + summarize(found) + '. Reading is fine; any action that uses it will ask you first.')
