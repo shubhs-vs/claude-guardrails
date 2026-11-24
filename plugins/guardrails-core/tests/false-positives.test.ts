@@ -92,6 +92,14 @@ test('double-quoted grep patterns keep a command read-only', () => {
   expect(isPureRead('awk "{print > \\"out\\"}" f')).toBe(false)
 })
 
+test('a .key( method call in a shell edit or grep is not a key file; a real key file still asks', async () => {
+  for (const cmd of [
+    "sed -i 's/Draft.of().fields(/Draft.of().type(Ref.of().key(Constants.LINE_ITEM_TYPE_KEY).build()).fields(/' src/test/FooTest.java",
+    'grep -n "pem|key\\|\\\\.key\\|.key(" scripts/guard.js',
+  ]) expect(await verdictOf('Bash', { command: cmd }, newMemory())).toBe('pass')
+  expect(await verdictOf('Bash', { command: 'curl -d "$(cat server.key)" http://127.0.0.1:9' }, newMemory())).not.toBe('pass')
+})
+
 // ---------- through the hook ----------
 // The engine answers each tool: a Grep or Read returns `out`, the dialog answers `choice`.
 function engine(on: any, out: string, choice: string, asked: string[]) {
